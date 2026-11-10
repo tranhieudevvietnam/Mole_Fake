@@ -61,8 +61,9 @@ type model struct {
 	lastUpdated   time.Time
 	collecting    bool
 	animFrame     int
-	catHidden     bool // true = hidden, false = visible
-	cpuCores      int  // how many CPU cores to list; 0 = all
+	animNow       time.Time // when the current animation frame was drawn
+	catHidden     bool      // true = hidden, false = visible
+	cpuCores      int       // how many CPU cores to list; 0 = all
 }
 
 // padViewToHeight ensures the rendered frame always overwrites the full
@@ -155,7 +156,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickAfter(delay)
 	case animTickMsg:
 		m.animFrame++
-		return m, animTickWithSpeed(m.metrics.CPU.Usage)
+		m.animNow = time.Now()
+		return m, animTick()
 	}
 	return m, nil
 }
@@ -170,7 +172,8 @@ func (m model) View() string {
 		termWidth = 80
 	}
 
-	header, mole := renderHeader(m.metrics, m.errMessage, m.animFrame, termWidth, m.catHidden)
+	molePhase := moleLapPhase(m.animNow, m.metrics.powerRefreshedAt)
+	header, mole := renderHeader(m.metrics, m.errMessage, m.animFrame, termWidth, m.catHidden, molePhase)
 	alertBar := renderProcessAlertBar(
 		m.metrics.ProcessAlerts,
 		m.metrics.ProcessStale,
@@ -178,14 +181,14 @@ func (m model) View() string {
 		termWidth,
 	)
 
-	renderFrame := func(cpuCores int) string {
+	renderFrame := func(cpuCores, processRows int) string {
 		var cardContent string
 		if termWidth <= 80 {
 			cardWidth := termWidth
 			if cardWidth > 2 {
 				cardWidth -= 2
 			}
-			cards := buildCards(m.metrics, cardWidth, cpuCores, m.fullCollected)
+			cards := buildCardsWithProcessRows(m.metrics, cardWidth, cpuCores, m.fullCollected, processRows)
 
 			var rendered []string
 			for i, c := range cards {
@@ -197,7 +200,7 @@ func (m model) View() string {
 			cardContent = lipgloss.JoinVertical(lipgloss.Left, rendered...)
 		} else {
 			cardWidth := max(24, termWidth/2-4)
-			cards := buildCards(m.metrics, cardWidth, cpuCores, m.fullCollected)
+			cards := buildCardsWithProcessRows(m.metrics, cardWidth, cpuCores, m.fullCollected, processRows)
 			cardContent = renderTwoColumns(cards, termWidth)
 		}
 
@@ -218,10 +221,22 @@ func (m model) View() string {
 	// Step the preference back down until the frame fits; the stored
 	// preference is untouched, so a taller window gets it back.
 	cpuCores := m.cpuCores
-	output := renderFrame(cpuCores)
+	output := renderFrame(cpuCores, minProcessRows)
 	for m.height > 0 && lipgloss.Height(output) > m.height && cpuCores != cpuCoresCycle[0] {
 		cpuCores = smallerCPUCores(cpuCores)
-		output = renderFrame(cpuCores)
+		output = renderFrame(cpuCores, minProcessRows)
+	}
+	// Spare rows go to more processes, after the stored core preference has
+	// been honored. One more row in the Processes card adds at most one frame
+	// row, so the spare count bounds the first try and a short walk down
+	// finds the largest that fits.
+	if spare := m.height - lipgloss.Height(output); m.height > 0 && spare > 0 {
+		for rows := min(maxProcessRows, minProcessRows+spare); rows > minProcessRows; rows-- {
+			if candidate := renderFrame(cpuCores, rows); lipgloss.Height(candidate) <= m.height {
+				output = candidate
+				break
+			}
+		}
 	}
 	if m.height > 0 && lipgloss.Height(output) > m.height {
 		output = renderTerminalTooSmall(termWidth, m.height)
@@ -239,14 +254,42 @@ func tickAfter(delay time.Duration) tea.Cmd {
 	return tea.Tick(delay, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
+// animFrameInterval paces the mole. Its position comes from the clock (see
+// moleLapPhase), so the frame rate only sets how smoothly it moves.
+const animFrameInterval = 100 * time.Millisecond
+
 func animTick() tea.Cmd {
-	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return animTickMsg{} })
+	return tea.Tick(animFrameInterval, func(time.Time) tea.Msg { return animTickMsg{} })
 }
 
-func animTickWithSpeed(cpuUsage float64) tea.Cmd {
-	// Higher CPU = faster animation.
-	interval := max(300-int(cpuUsage*2.5), 50)
-	return tea.Tick(time.Duration(interval)*time.Millisecond, func(time.Time) tea.Msg { return animTickMsg{} })
+// moleLapPeriod is one lap of the mole, out to the right edge and back. It is
+// the power refresh interval, and a lap starts at each power refresh, so the
+// mole's position counts down to the next Power and Ports update.
+const moleLapPeriod = powerRefreshInterval
+
+// moleLapPhase returns how far through its lap the mole is at now, from 0 at
+// the left edge to 0.5 at the right edge and back to 1. lapStart is the last
+// power refresh.
+//
+// The refresh itself lands on the first one-second collection tick after the
+// interval, a fraction of a second late, so a finished lap waits at the left
+// edge for it instead of starting early and jumping back when it lands. With
+// no refresh (another platform) or one that stopped arriving for a whole
+// extra lap, the mole follows the wall clock so it keeps moving.
+func moleLapPhase(now, lapStart time.Time) float64 {
+	if now.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(lapStart)
+	switch {
+	case lapStart.IsZero() || elapsed < 0 || elapsed >= 2*moleLapPeriod:
+		clock := time.Duration(now.UnixNano()) % moleLapPeriod
+		return float64(clock) / float64(moleLapPeriod)
+	case elapsed >= moleLapPeriod:
+		return 0
+	default:
+		return float64(elapsed) / float64(moleLapPeriod)
+	}
 }
 
 // runJSONMode collects metrics once and outputs as JSON.

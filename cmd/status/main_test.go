@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"reflect"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/shirou/gopsutil/v4/disk"
 )
 
@@ -463,6 +466,7 @@ func TestCollectorKeepsLiveProcessDataWhenApplyingEnrichment(t *testing.T) {
 
 func TestMetricsSnapshotFieldsHaveCollectionClassifications(t *testing.T) {
 	classified := map[string]string{
+		"powerRefreshedAt":      "fast",
 		"CollectedAt":           "fast",
 		"Host":                  "fast",
 		"Platform":              "fast",
@@ -473,7 +477,7 @@ func TestMetricsSnapshotFieldsHaveCollectionClassifications(t *testing.T) {
 		"HealthScore":           "recomputed",
 		"HealthScoreMsg":        "recomputed",
 		"CPU":                   "mixed",
-		"GPU":                   "enrichment",
+		"GPU":                   "mixed",
 		"Memory":                "mixed",
 		"Disks":                 "enrichment",
 		"TrashSize":             "enrichment",
@@ -482,8 +486,8 @@ func TestMetricsSnapshotFieldsHaveCollectionClassifications(t *testing.T) {
 		"Network":               "fast",
 		"NetworkHistory":        "fast",
 		"Proxy":                 "enrichment",
-		"Batteries":             "enrichment",
-		"Thermal":               "enrichment",
+		"Batteries":             "mixed",
+		"Thermal":               "mixed",
 		"Sensors":               "enrichment",
 		"Bluetooth":             "enrichment",
 		"TopProcesses":          "live-or-enrichment",
@@ -494,6 +498,7 @@ func TestMetricsSnapshotFieldsHaveCollectionClassifications(t *testing.T) {
 		"ZombieParentsComplete": "live-or-enrichment",
 		"ProcessWatch":          "config",
 		"ProcessAlerts":         "live-or-enrichment",
+		"Self":                  "fast",
 	}
 
 	typ := reflect.TypeFor[MetricsSnapshot]()
@@ -646,5 +651,102 @@ func TestWriteJSONSnapshotReportsOutputFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "error encoding JSON:") {
 		t.Fatalf("missing output error: %q", &stderr)
+	}
+}
+
+func TestMoleLapPhaseFollowsPowerRefresh(t *testing.T) {
+	start := time.Date(2026, 11, 9, 15, 0, 0, 0, time.UTC)
+	cases := []struct {
+		at   time.Duration
+		want float64
+	}{
+		{0, 0},
+		{moleLapPeriod / 4, 0.25},
+		{moleLapPeriod / 2, 0.5},
+		{moleLapPeriod * 3 / 4, 0.75},
+		// A refresh that lands late finds the mole waiting at the left edge.
+		{moleLapPeriod, 0},
+		{moleLapPeriod + 900*time.Millisecond, 0},
+	}
+	for _, tc := range cases {
+		if got := moleLapPhase(start.Add(tc.at), start); math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("at +%v: phase %v, want %v", tc.at, got, tc.want)
+		}
+	}
+	if moleLapPeriod != powerRefreshInterval {
+		t.Fatalf("one lap must last one power refresh, got %v and %v", moleLapPeriod, powerRefreshInterval)
+	}
+}
+
+func TestMoleLapPhaseWithoutRefreshFollowsClock(t *testing.T) {
+	if got := moleLapPhase(time.Time{}, time.Time{}); got != 0 {
+		t.Fatalf("before the first frame the mole sits at the left edge, got %v", got)
+	}
+	now := time.Date(2026, 11, 9, 15, 0, 0, 0, time.UTC)
+	// No refresh, a refresh in the future, or one that stopped arriving.
+	for _, lapStart := range []time.Time{{}, now.Add(time.Minute), now.Add(-2 * moleLapPeriod)} {
+		if got := moleLapPhase(now, lapStart); got < 0 || got >= 1 {
+			t.Fatalf("lap start %v: phase %v out of [0, 1)", lapStart, got)
+		}
+	}
+}
+
+func TestModelViewFillsSpareRowsWithProcesses(t *testing.T) {
+	stale := false
+	var procs []ProcessInfo
+	for i := range maxProcessRows {
+		procs = append(procs, ProcessInfo{Name: fmt.Sprintf("proc%d", i), CPU: float64(90 - i)})
+	}
+	snapshot := MetricsSnapshot{
+		CPU:          CPUStatus{Usage: 25, LogicalCPU: 10, PerCore: []float64{10, 20}},
+		Memory:       MemoryStatus{Total: 16 << 30, Used: 8 << 30, Available: 8 << 30},
+		Disks:        []DiskStatus{{Mount: "/", Device: "/dev/disk3s1", Total: 100 << 30, Used: 50 << 30, Fstype: "apfs"}},
+		Network:      []NetworkStatus{{Name: "en0", RxRateMBs: 1, TxRateMBs: 0.5}},
+		Batteries:    []BatteryStatus{{Percent: 70, Status: "Discharging"}},
+		TopProcesses: procs,
+		ProcessStale: &stale,
+	}
+	m := model{width: 100, schedule: collectionSchedule{hasSnapshot: true}, metrics: snapshot, cpuCores: 2, fullCollected: true, catHidden: true}
+	rows := func(view string) int { return strings.Count(stripANSI(view), "proc") }
+
+	base := m.View()
+	baseHeight := lipgloss.Height(base)
+	if rows(base) != minProcessRows {
+		t.Fatalf("an unknown height keeps %d rows, got %d", minProcessRows, rows(base))
+	}
+
+	m.height = baseHeight + 2
+	if got := rows(m.View()); got != minProcessRows+2 {
+		t.Fatalf("two spare rows should list %d processes, got %d", minProcessRows+2, got)
+	}
+	if view := m.View(); lipgloss.Height(view) != m.height {
+		t.Fatalf("the frame must still fit: %d lines for %d rows", lipgloss.Height(view), m.height)
+	}
+
+	m.height = baseHeight + 40
+	if got := rows(m.View()); got != maxProcessRows {
+		t.Fatalf("a tall window caps at %d processes, got %d", maxProcessRows, got)
+	}
+
+	m.height = baseHeight
+	if got := rows(m.View()); got != minProcessRows {
+		t.Fatalf("no spare rows keeps %d processes, got %d", minProcessRows, got)
+	}
+}
+
+func TestCollectorCarriesCoreTypesToFastSnapshots(t *testing.T) {
+	collector := NewCollector(ProcessWatchOptions{})
+	collector.hasEnrichment = true
+	collector.enrichment = snapshotEnrichment{cpuPCores: 8, cpuECores: 2, cpuCoreTypes: []string{"E", "E", "P"}}
+
+	next := MetricsSnapshot{}
+	collector.applyEnrichment(&next, false)
+
+	if len(next.CPU.CoreTypes) != 3 || next.CPU.CoreTypes[0] != "E" || next.CPU.CoreTypes[2] != "P" {
+		t.Fatalf("fast snapshots need the cached cluster types, got %v", next.CPU.CoreTypes)
+	}
+	next.CPU.CoreTypes[0] = "P"
+	if collector.enrichment.cpuCoreTypes[0] != "E" {
+		t.Fatal("a snapshot must not write into the cached cluster types")
 	}
 }

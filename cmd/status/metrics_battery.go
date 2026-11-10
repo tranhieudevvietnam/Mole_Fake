@@ -350,9 +350,13 @@ func collectThermal() ThermalStatus {
 
 	var thermal ThermalStatus
 
-	// Fan info from cached system_profiler.
-	out := getSystemPowerOutput()
-	if out != "" {
+	// Fan speed from the SMC (FNum and F<n>Ac). A Mac whose SMC answers with no
+	// fans keeps FanSpeed at 0; system_profiler is only the fallback when the
+	// SMC cannot be read at all.
+	if fans, err := readFans(); err == nil {
+		thermal.Fans = fans
+		thermal.FanCount, thermal.FanSpeed = fanSummary(fans)
+	} else if out := getSystemPowerOutput(); out != "" {
 		for line := range strings.Lines(out) {
 			lower := strings.ToLower(line)
 			if strings.Contains(lower, "fan") && strings.Contains(lower, "speed") {
@@ -368,7 +372,9 @@ func collectThermal() ThermalStatus {
 	// Power metrics from ioreg (fast, real-time).
 	ctxPower, cancelPower := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancelPower()
+	var batteryOut string
 	if out, err := runCmd(ctxPower, "ioreg", "-rn", "AppleSmartBattery"); err == nil {
+		batteryOut = out
 		powerThermal := parseAppleSmartBatteryThermal(out)
 		thermal.BatteryTemp = powerThermal.BatteryTemp
 		thermal.SystemPower = powerThermal.SystemPower
@@ -387,8 +393,22 @@ func collectThermal() ThermalStatus {
 		}
 	}
 
-	// Do not synthesize CPU temperature from battery sensors or cpu_thermal_level.
-	// Those values are not CPU-package temperatures and produce false overheating data.
+	// CPU temperature comes from the SMC per-core keys where the chip's keys are
+	// known (cpuCoreTempKeys), else the HID CPU cluster or Intel CPU sensors
+	// (cpuTempSensorGroups): CPUTemp is their average, CPUMaxTemp the hottest.
+	// Do not synthesize it from battery, PMU or cpu_thermal_level readings:
+	// those are not CPU temperatures and produce false data.
+	cores, err := readCPUCoreTemps()
+	if err != nil || averageTemp(cores) == 0 {
+		cores = nil
+		if stats, err := readTemperatureSensors(); err == nil {
+			cores = cpuTempsFromSensors(stats)
+		}
+	}
+	thermal.CPUTemp = averageTemp(cores)
+	thermal.CPUMaxTemp = maxTemp(cores)
+
+	thermal.Ports = collectPorts(batteryOut)
 	return thermal
 }
 

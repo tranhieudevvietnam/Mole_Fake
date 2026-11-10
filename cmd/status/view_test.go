@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1081,7 +1084,7 @@ func TestSparkline(t *testing.T) {
 }
 
 func TestRenderHeaderErrorReturnsMoleOnce(t *testing.T) {
-	header, mole := renderHeader(MetricsSnapshot{}, "boom", 0, 120, false)
+	header, mole := renderHeader(MetricsSnapshot{}, "boom", 0, 120, false, 0)
 
 	if mole != "" {
 		t.Fatalf("renderHeader() mole return should be empty on error to avoid duplicate render, got %q", mole)
@@ -1376,7 +1379,7 @@ func TestRenderHeaderUsesFastMetricSpecFallbacks(t *testing.T) {
 		Disks:       []DiskStatus{{Mount: "/", Total: diskSize}},
 	}
 
-	header, _ := renderHeader(m, "", 0, 120, true)
+	header, _ := renderHeader(m, "", 0, 120, true, 0)
 	plain := stripANSI(header)
 	wantRAM := "RAM " + humanBytes(ram)
 	wantDisk := "Disk " + humanBytes(diskSize)
@@ -1402,7 +1405,7 @@ func TestRenderHeaderWrapsOnNarrowWidth(t *testing.T) {
 		Uptime: "10d 3h",
 	}
 
-	header, _ := renderHeader(m, "", 0, 38, true)
+	header, _ := renderHeader(m, "", 0, 38, true, 0)
 	for line := range strings.Lines(header) {
 		if lipgloss.Width(stripANSI(line)) > 38 {
 			t.Fatalf("renderHeader() line exceeds width: %q", line)
@@ -1424,7 +1427,7 @@ func TestRenderHeaderHidesOSAndUptimeOnNarrowWidth(t *testing.T) {
 		Uptime: "10d 3h",
 	}
 
-	header, _ := renderHeader(m, "", 0, 80, true)
+	header, _ := renderHeader(m, "", 0, 80, true, 0)
 	plain := stripANSI(header)
 	if strings.Contains(plain, "macOS 15.0") {
 		t.Fatalf("renderHeader() narrow width should hide os version, got %q", plain)
@@ -1447,7 +1450,7 @@ func TestRenderHeaderKeepsLabeledSpecsOnCompactWidth(t *testing.T) {
 		GPU: []GPUStatus{{CoreCount: 20}},
 	}
 
-	header, _ := renderHeader(m, "", 0, 80, true)
+	header, _ := renderHeader(m, "", 0, 80, true, 0)
 	plain := stripANSI(header)
 	if !strings.Contains(plain, "RAM 48G") || !strings.Contains(plain, "Disk 926GB") {
 		t.Fatalf("renderHeader() compact width should keep labeled specs, got %q", plain)
@@ -1477,7 +1480,7 @@ func TestRenderHeaderDropsLowPriorityInfoToStaySingleLine(t *testing.T) {
 		Uptime: "9d 13h",
 	}
 
-	header, _ := renderHeader(m, "", 0, 100, true)
+	header, _ := renderHeader(m, "", 0, 100, true, 0)
 	plain := stripANSI(header)
 	if strings.Contains(plain, "\n") {
 		t.Fatalf("renderHeader() should stay single line when trimming low-priority fields, got %q", plain)
@@ -1895,5 +1898,306 @@ func TestBatteryCardUnknownCapacityKeepsSystemCondition(t *testing.T) {
 	rendered := strings.Join(card.lines, "\n")
 	if !strings.Contains(rendered, "Service Recommended") || !strings.Contains(rendered, "100 cycles") || strings.Contains(rendered, "Healthy") {
 		t.Fatalf("independent system condition or cycles lost: %q", rendered)
+	}
+}
+
+func TestBatteryCardLeavesFanSpeedToThermalCard(t *testing.T) {
+	card := renderBatteryCard([]BatteryStatus{{Percent: 89, Capacity: 84, CycleCount: 271, Status: "Charged"}},
+		ThermalStatus{BatteryTemp: 36.9, FanSpeed: 2473, FanCount: 2, Fans: m1ProFans}, true)
+	rendered := stripANSI(strings.Join(card.lines, "\n"))
+	if strings.Contains(rendered, "RPM") {
+		t.Fatalf("fan speed belongs to the Thermal card, not the Power summary: %q", rendered)
+	}
+	if !strings.Contains(rendered, "36.9°C") {
+		t.Fatalf("battery temperature must stay in the Power summary: %q", rendered)
+	}
+}
+
+func TestThermalCardShowsTempAndEachFan(t *testing.T) {
+	card, ok := renderThermalCard(ThermalStatus{CPUTemp: 58.9, CPUMaxTemp: 63.2, FanSpeed: 2473, FanCount: 2, Fans: m1ProFans}, true)
+	if !ok || card.title != "Thermal" {
+		t.Fatalf("expected a Thermal card, got ok=%v title=%q", ok, card.title)
+	}
+	if len(card.lines) != 3 {
+		t.Fatalf("expected hottest core, left and right rows, got %q", card.lines)
+	}
+	for i, want := range []struct{ label, value string }{{"Core", "63.2°C max"}, {"Left", "2385 RPM"}, {"Right", "2561 RPM"}} {
+		line := stripANSI(card.lines[i])
+		if !strings.HasPrefix(line, want.label+" ") || !strings.HasSuffix(line, want.value) {
+			t.Errorf("row %d = %q, want %s ... %s", i, line, want.label, want.value)
+		}
+	}
+	// Every row starts its bar at the same column as the Power card rows.
+	for _, line := range card.lines {
+		if idx := strings.IndexAny(stripANSI(line), "█░"); idx != metricLabelWidth+1 {
+			t.Errorf("bar starts at byte %d, want %d: %q", idx, metricLabelWidth+1, stripANSI(line))
+		}
+	}
+}
+
+func TestThermalCardShowsHottestCoreWhileCPUCardShowsAverage(t *testing.T) {
+	thermal := ThermalStatus{CPUTemp: 66.6, CPUMaxTemp: 72.0}
+	card, ok := renderThermalCard(thermal, true)
+	if !ok || !strings.HasSuffix(stripANSI(card.lines[0]), "72.0°C max") {
+		t.Fatalf("the Thermal card shows the hottest core, got %q", card.lines)
+	}
+	cpuCard := renderCPUCard(CPUStatus{Usage: 36}, thermal, 0)
+	if !strings.Contains(stripANSI(cpuCard.lines[0]), "@ 66.6°C") {
+		t.Fatalf("the CPU card shows the core average, got %q", cpuCard.lines[0])
+	}
+}
+
+func TestThermalCardFanWithoutMaximumHasNoBar(t *testing.T) {
+	card, ok := renderThermalCard(ThermalStatus{Fans: []FanReading{{Name: "Fan", RPM: 1800}}}, true)
+	if !ok || len(card.lines) != 1 {
+		t.Fatalf("expected one fan row, got ok=%v lines=%q", ok, card.lines)
+	}
+	if line := stripANSI(card.lines[0]); strings.ContainsAny(line, "█░") || !strings.HasSuffix(line, "1800 RPM") {
+		t.Fatalf("a fan with no maximum has nothing to scale a bar against: %q", line)
+	}
+}
+
+func TestThermalCardKeepsSystemProfilerFanFallback(t *testing.T) {
+	card, ok := renderThermalCard(ThermalStatus{FanSpeed: 1800}, true)
+	if !ok || len(card.lines) != 1 || !strings.HasSuffix(stripANSI(card.lines[0]), "1800 RPM") {
+		t.Fatalf("expected the fallback fan speed row, got ok=%v lines=%q", ok, card.lines)
+	}
+}
+
+func TestThermalCardPlaceholdersBeforeFullCollection(t *testing.T) {
+	card, ok := renderThermalCard(ThermalStatus{}, false)
+	if !ok || len(card.lines) != 2 {
+		t.Fatalf("expected placeholder rows before the first full collection, got ok=%v lines=%q", ok, card.lines)
+	}
+	for _, line := range card.lines {
+		if !strings.HasSuffix(stripANSI(line), placeholderValue) {
+			t.Fatalf("expected a placeholder value, got %q", line)
+		}
+	}
+}
+
+func TestPortsCardOrdersInOutThenFree(t *testing.T) {
+	card, ok := renderPortsCard([]PortPower{
+		{Name: "USB-C 1"},
+		{Name: "USB-C 2"},
+		{Name: "USB-C 3", Connected: true, Direction: "out", Voltage: 5.243, Current: 0.193, Power: 1.012, ContractVoltage: 5, MaxPower: 15},
+		{Name: "MagSafe", Connected: true, Direction: "in", Voltage: 20.188, Current: 1.313, Power: 26.513, ContractVoltage: 20, MaxPower: 65.2},
+	})
+	if !ok || card.title != "Ports" || len(card.lines) != 3 {
+		t.Fatalf("expected in, out and free rows, got ok=%v lines=%q", ok, card.lines)
+	}
+	want := []string{
+		"MagSafe  In   20.2V 1.31A  26.5W / 65W",
+		"USB-C 3  Out   5.2V 0.19A   1.0W / 15W",
+		"Free     USB-C 1, USB-C 2",
+	}
+	for i, w := range want {
+		if got := stripANSI(card.lines[i]); got != w {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestPortsCardInputWithoutLiveTelemetryShowsContract(t *testing.T) {
+	card, ok := renderPortsCard([]PortPower{{Name: "USB-C 1", Connected: true, Direction: "in", ContractVoltage: 20, MaxPower: 100}})
+	if !ok || len(card.lines) != 1 {
+		t.Fatalf("expected one input row, got ok=%v lines=%q", ok, card.lines)
+	}
+	if got := stripANSI(card.lines[0]); got != "USB-C 1  In   20.0V max 100W" {
+		t.Fatalf("an input with no live reading shows its contract, got %q", got)
+	}
+}
+
+func TestPortsCardConnectedWithoutPowerAndAllFree(t *testing.T) {
+	card, _ := renderPortsCard([]PortPower{{Name: "USB-C 2", Connected: true}})
+	if got := stripANSI(card.lines[0]); got != "USB-C 2  connected" {
+		t.Fatalf("a port with no power data is only connected, got %q", got)
+	}
+	card, _ = renderPortsCard([]PortPower{{Name: "USB-C 1"}, {Name: "MagSafe"}})
+	if len(card.lines) != 1 || stripANSI(card.lines[0]) != "Free     USB-C 1, MagSafe" {
+		t.Fatalf("all-free ports fold into one row, got %q", card.lines)
+	}
+	if _, ok := renderPortsCard(nil); ok {
+		t.Fatal("a Mac with no USB-C or MagSafe ports has no Ports card")
+	}
+}
+
+func TestThermalCardOmittedWithoutTempOrFans(t *testing.T) {
+	if card, ok := renderThermalCard(ThermalStatus{BatteryTemp: 31}, true); ok {
+		t.Fatalf("a full collection with no CPU temp and no fan must drop the card, got %q", card.lines)
+	}
+}
+
+func TestGetMoleFrameFollowsLapPhase(t *testing.T) {
+	const width = 100
+	maxPos := width - 15
+	leading := func(frame string) int {
+		first := strings.Split(frame, "\n")[0]
+		return len(first) - len(strings.TrimLeft(first, " "))
+	}
+	body := func(frame string) string {
+		lines := strings.Split(frame, "\n")
+		for i := range lines {
+			lines[i] = strings.TrimLeft(lines[i], " ")
+		}
+		return strings.Join(lines, "\n")
+	}
+	trimmed := func(frames [][]string, i int) string {
+		lines := slices.Clone(frames[i%len(frames)])
+		for j := range lines {
+			lines[j] = strings.TrimLeft(lines[j], " ")
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	cases := []struct {
+		phase    float64
+		wantPos  int
+		mirrored bool
+	}{
+		{0, 0, false},
+		{0.25, int(math.Round(float64(maxPos) / 2)), false},
+		{0.5, maxPos, true},
+		{0.75, int(math.Round(float64(maxPos) / 2)), true},
+		{0.999, 0, true},
+	}
+	for _, tc := range cases {
+		frames := moleBody
+		if tc.mirrored {
+			frames = moleBodyMirror
+		}
+		// The art has its own leading spaces; the padding adds the position.
+		art := frames[0][0]
+		inset := len(art) - len(strings.TrimLeft(art, " "))
+		frame := getMoleFrame(0, width, tc.phase)
+		if got := leading(frame) - inset; got != tc.wantPos {
+			t.Errorf("phase %v: mole at column %d, want %d", tc.phase, got, tc.wantPos)
+		}
+		want := trimmed(frames, 0)
+		if body(frame) != want {
+			t.Errorf("phase %v: mirrored=%v frame expected", tc.phase, tc.mirrored)
+		}
+	}
+	// Legs still step with each frame while the position stays put.
+	if getMoleFrame(0, width, 0.25) == getMoleFrame(1, width, 0.25) {
+		t.Fatal("consecutive frames must step the legs")
+	}
+}
+
+func TestRenderSwapAppsLineFitsCardWidth(t *testing.T) {
+	apps := []SwapApp{
+		{Name: "dart", Compressed: 6717 << 20},
+		{Name: "Figma", Compressed: 2619 << 20},
+		{Name: "Visual Studio Code", Compressed: 1590 << 20},
+	}
+	line := stripANSI(renderSwapAppsLine(apps, 46, true))
+	if !strings.HasPrefix(line, "Swap   dart ") || !strings.Contains(line, " · Figma ") {
+		t.Fatalf("expected the two largest apps, got %q", line)
+	}
+	if strings.Contains(line, "Visual Studio Code") || lipgloss.Width(line) > 46 {
+		t.Fatalf("the line must stop at the card width, got %q (%d cells)", line, lipgloss.Width(line))
+	}
+	narrow := stripANSI(renderSwapAppsLine([]SwapApp{{Name: "Visual Studio Code", Compressed: 1590 << 20}}, 24, false))
+	if lipgloss.Width(narrow) > 24 || !strings.Contains(narrow, "…") {
+		t.Fatalf("the first app always shows, shortened to fit, got %q", narrow)
+	}
+}
+
+func TestProcessCardShowsSwapAppsWhenCollected(t *testing.T) {
+	stale := false
+	snapshot := MetricsSnapshot{
+		ProcessStale: &stale,
+		TopProcesses: []ProcessInfo{{Name: "dart", CPU: 40}},
+		Memory:       MemoryStatus{Pressure: "warn", SwapApps: []SwapApp{{Name: "dart", Compressed: 6717 << 20}}},
+	}
+	processLines := func(s MetricsSnapshot) string {
+		for _, card := range buildCards(s, 46, 0, true) {
+			if card.title == "Processes" {
+				return stripANSI(strings.Join(card.lines, "\n"))
+			}
+		}
+		t.Fatal("no Processes card")
+		return ""
+	}
+	if got := processLines(snapshot); !strings.Contains(got, "Swap   dart") {
+		t.Fatalf("under pressure the Processes card names the swap apps, got %q", got)
+	}
+	// Heavy swap at normal pressure: the collector still read the apps.
+	snapshot.Memory.Pressure = "normal"
+	if got := processLines(snapshot); !strings.Contains(got, "Swap   dart") {
+		t.Fatalf("collected swap apps show at normal pressure too, got %q", got)
+	}
+	snapshot.Memory.SwapApps = nil
+	if got := processLines(snapshot); strings.Contains(got, "Swap") {
+		t.Fatalf("without swap apps there is no swap line, got %q", got)
+	}
+}
+
+func TestRenderProcessCardRowsHonorsLimit(t *testing.T) {
+	var procs []ProcessInfo
+	for i := range 8 {
+		procs = append(procs, ProcessInfo{Name: fmt.Sprintf("p%d", i), CPU: float64(80 - i)})
+	}
+	if got := len(renderProcessCardRows(procs, 46, 5).lines); got != 5 {
+		t.Fatalf("expected 5 rows, got %d", got)
+	}
+	if got := len(renderProcessCard(procs, 46).lines); got != minProcessRows {
+		t.Fatalf("the default card keeps %d rows, got %d", minProcessRows, got)
+	}
+}
+
+func TestStatusDiagnosisNamesTopSwapApp(t *testing.T) {
+	stale := false
+	m := MetricsSnapshot{
+		CPU:          CPUStatus{Usage: 20},
+		ProcessStale: &stale,
+		Memory:       MemoryStatus{UsedPercent: 76, Pressure: "warn", SwapApps: []SwapApp{{Name: "dart", Compressed: 6717 << 20}}},
+		TopProcesses: []ProcessInfo{{Name: "claude", Memory: 9}},
+	}
+	if got := statusDiagnosisLine(m); got != "dart memory pressure" {
+		t.Fatalf("statusDiagnosisLine() = %q, want the top swap app", got)
+	}
+}
+
+func TestCPUCardShowsClusterAveragesOnAppleSilicon(t *testing.T) {
+	cpu := CPUStatus{
+		Usage:      40,
+		PerCore:    []float64{100, 98, 60, 40, 30, 20, 10, 10, 6, 4},
+		CoreTypes:  []string{"E", "E", "P", "P", "P", "P", "P", "P", "P", "P"},
+		PCoreCount: 8, ECoreCount: 2, LogicalCPU: 10,
+	}
+	plain := func(card cardData) []string {
+		var out []string
+		for _, l := range card.lines {
+			out = append(out, stripANSI(l))
+		}
+		return out
+	}
+
+	lines := plain(renderCPUCard(cpu, ThermalStatus{}, 2))
+	if len(lines) != 4 || !strings.HasPrefix(lines[1], "E-core ") || !strings.HasSuffix(lines[1], " 99.0%") ||
+		!strings.HasPrefix(lines[2], "P-core ") || !strings.HasSuffix(lines[2], " 22.5%") {
+		t.Fatalf("two-row mode should show the E and P cluster averages, got %q", lines)
+	}
+
+	lines = plain(renderCPUCard(cpu, ThermalStatus{}, 4))
+	if len(lines) != 6 || !strings.HasPrefix(lines[3], "Core1 ") || !strings.HasPrefix(lines[4], "Core2 ") {
+		t.Fatalf("four-row mode adds the two busiest cores after the clusters, got %q", lines)
+	}
+
+	lines = plain(renderCPUCard(cpu, ThermalStatus{}, 0))
+	if len(lines) != 2+2+10 {
+		t.Fatalf("all mode lists both clusters and every core, got %d lines", len(lines))
+	}
+}
+
+func TestCPUCardKeepsBusiestCoresWithoutClusterTypes(t *testing.T) {
+	cpu := CPUStatus{Usage: 40, PerCore: []float64{10, 90, 50}, LogicalCPU: 3}
+	for _, types := range [][]string{nil, {"E", "P"}, {"P", "P", "P"}} {
+		cpu.CoreTypes = types
+		lines := renderCPUCard(cpu, ThermalStatus{}, 2).lines
+		if len(lines) != 4 || !strings.HasPrefix(stripANSI(lines[1]), "Core2 ") || !strings.HasPrefix(stripANSI(lines[2]), "Core3 ") {
+			t.Fatalf("types %v: expected the two busiest cores, got %q", types, lines)
+		}
 	}
 }

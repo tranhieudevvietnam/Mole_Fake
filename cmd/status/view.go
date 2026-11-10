@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -48,6 +50,7 @@ const (
 	iconBattery = "◪"
 	iconSensors = "◈"
 	iconProcs   = "❊"
+	iconPorts   = "⌁"
 
 	metricLabelWidth    = 6
 	processMemoryWidth  = 7
@@ -114,20 +117,20 @@ var moleBodyMirror = [][]string{
 	},
 }
 
-// getMoleFrame renders the animated mole.
-func getMoleFrame(animFrame int, termWidth int) string {
+// getMoleFrame renders the animated mole. lapPhase (0 to 1, see moleLapPhase)
+// places it: out to the right edge over the first half, back over the second.
+// animFrame only steps its legs.
+func getMoleFrame(animFrame int, termWidth int, lapPhase float64) string {
 	moleWidth := 15
 	maxPos := max(termWidth-moleWidth, 0)
 
-	cycleLength := maxPos * 2
-	if cycleLength == 0 {
-		cycleLength = 1
-	}
-	pos := animFrame % cycleLength
-	movingLeft := pos > maxPos
+	lapPhase = min(max(lapPhase, 0), 1)
+	movingLeft := lapPhase >= 0.5
+	travel := lapPhase * 2
 	if movingLeft {
-		pos = cycleLength - pos
+		travel = 2 - travel
 	}
+	pos := min(max(int(math.Round(travel*float64(maxPos))), 0), maxPos)
 
 	// Use mirror frames when moving left
 	var frames [][]string
@@ -156,7 +159,7 @@ type cardData struct {
 	lines []string
 }
 
-func renderHeader(m MetricsSnapshot, errMsg string, animFrame int, termWidth int, catHidden bool) (string, string) {
+func renderHeader(m MetricsSnapshot, errMsg string, animFrame int, termWidth int, catHidden bool, molePhase float64) (string, string) {
 	if termWidth <= 0 {
 		termWidth = 80
 	}
@@ -272,7 +275,7 @@ func renderHeader(m MetricsSnapshot, errMsg string, animFrame int, termWidth int
 	// Show cat unless hidden - render mole centered below header
 	var mole string
 	if !catHidden {
-		mole = getMoleFrame(animFrame, termWidth)
+		mole = getMoleFrame(animFrame, termWidth, molePhase)
 	}
 
 	if errMsg != "" {
@@ -378,6 +381,14 @@ func renderBanner(style lipgloss.Style, text string, width int) string {
 }
 
 func renderCPUCard(cpu CPUStatus, thermal ThermalStatus, cpuCores int) cardData {
+	return renderCPUCardWithGPU(cpu, thermal, cpuCores, nil)
+}
+
+// renderCPUCardWithGPU is the CPU card with a GPU usage row above the load
+// line. On Apple Silicon the GPU shares the CPU's die and memory, and the
+// row keeps the CPU card as tall as the Memory card beside it instead of
+// adding a card row to the dashboard.
+func renderCPUCardWithGPU(cpu CPUStatus, thermal ThermalStatus, cpuCores int, gpus []GPUStatus) cardData {
 	var lines []string
 
 	// Line 1: Usage + Temp (Format: 15% @ 30.4°C)
@@ -403,16 +414,30 @@ func renderCPUCard(cpu CPUStatus, thermal ThermalStatus, cpuCores int) cardData 
 		}
 		sort.Slice(cores, func(i, j int) bool { return cores[i].val > cores[j].val })
 
-		// cpuCores selects how many of the busiest cores to list; 0 (or any
-		// value >= the core count) means "all". Set via the 'c' key, persisted.
+		// On Apple Silicon the cluster averages lead: the busiest cores alone
+		// are nearly always the E-cores, which macOS fills with background work
+		// first, so two "busiest core" rows read as a pegged CPU while the
+		// P-cores sit half idle.
+		clusters := cpuClusterUsage(cpu)
+		for _, c := range clusters {
+			lines = append(lines, fmt.Sprintf("%-*s %s  %5.1f%%", metricLabelWidth, c.label, progressBar(c.usage), c.usage))
+		}
+
+		// cpuCores selects how many rows to list; 0 (or any value >= the core
+		// count) means "all". Set via the 'c' key, persisted. Cluster rows
+		// count toward it, and the rest go to the busiest cores.
 		maxCores := len(cores)
 		if cpuCores > 0 {
-			maxCores = min(len(cores), cpuCores)
+			maxCores = min(len(cores), max(cpuCores-len(clusters), 0))
 		}
 		for i := range maxCores {
 			c := cores[i]
 			lines = append(lines, fmt.Sprintf("Core%-2d %s  %5.1f%%", c.idx+1, progressBar(c.val), c.val))
 		}
+	}
+
+	if row, ok := gpuUsageRow(gpus); ok {
+		lines = append(lines, row)
 	}
 
 	// Load line at the end
@@ -425,6 +450,51 @@ func renderCPUCard(cpu CPUStatus, thermal ThermalStatus, cpuCores int) cardData 
 	}
 
 	return cardData{icon: iconCPU, title: "CPU", lines: lines}
+}
+
+// gpuUsageRow renders "GPU    <bar>  60.0%  1.3G" for the first GPU with a
+// measured usage. A GPU still at -1 (not measured) or a placeholder entry with
+// no cores and no memory figure gets no row.
+func gpuUsageRow(gpus []GPUStatus) (string, bool) {
+	if len(gpus) == 0 {
+		return "", false
+	}
+	g := gpus[0]
+	if g.Usage < 0 || (g.CoreCount == 0 && g.MemoryUsed <= 0) {
+		return "", false
+	}
+	row := fmt.Sprintf("%-*s %s  %5.1f%%", metricLabelWidth, "GPU", progressBar(g.Usage), g.Usage)
+	if g.MemoryUsed > 0 {
+		row += "  " + humanBytesCompact(uint64(g.MemoryUsed*(1<<20)))
+	}
+	return row, true
+}
+
+type clusterUsage struct {
+	label string
+	usage float64
+}
+
+// cpuClusterUsage averages the per-core usage of the E and P clusters, E
+// first, or returns nil when the cluster of every core is not known (Intel,
+// another platform, or a full collection that has not read the tree yet).
+func cpuClusterUsage(cpu CPUStatus) []clusterUsage {
+	if len(cpu.CoreTypes) == 0 || len(cpu.CoreTypes) != len(cpu.PerCore) {
+		return nil
+	}
+	sums := map[string]float64{}
+	counts := map[string]int{}
+	for i, kind := range cpu.CoreTypes {
+		sums[kind] += cpu.PerCore[i]
+		counts[kind]++
+	}
+	if counts["E"] == 0 || counts["P"] == 0 {
+		return nil
+	}
+	return []clusterUsage{
+		{label: "E-core", usage: sums["E"] / float64(counts["E"])},
+		{label: "P-core", usage: sums["P"] / float64(counts["P"])},
+	}
 }
 
 func renderMemoryCard(mem MemoryStatus, cardWidth int) cardData {
@@ -634,9 +704,20 @@ func ioBar(rate float64) string {
 	return okStyle.Render(bar)
 }
 
+// The Processes card lists at least minProcessRows processes and grows to
+// maxProcessRows when the terminal has rows to spare (see model.View). The
+// collector keeps maxProcessRows top processes for it.
+const (
+	minProcessRows = 3
+	maxProcessRows = 8
+)
+
 func renderProcessCard(procs []ProcessInfo, cardWidth int) cardData {
+	return renderProcessCardRows(procs, cardWidth, minProcessRows)
+}
+
+func renderProcessCardRows(procs []ProcessInfo, cardWidth int, maxProcs int) cardData {
 	var lines []string
-	maxProcs := 3
 	for i, p := range procs {
 		if i >= maxProcs {
 			break
@@ -663,6 +744,54 @@ func renderProcessCard(procs []ProcessInfo, cardWidth int) cardData {
 	return cardData{icon: iconProcs, title: "Processes", lines: lines}
 }
 
+// renderSelfUsageRow shows what mo status itself costs, laid out like a
+// process row: "Mole   <bar>   5.1%   25.0M". Dimmed, since it is about the
+// dashboard rather than the Mac.
+func renderSelfUsageRow(self SelfUsage, cardWidth int) string {
+	line := fmt.Sprintf("%-*s %s %5.1f%% %*s",
+		metricLabelWidth, "Mole",
+		processBar(min(self.CPUPercent, 100), cardWidth),
+		self.CPUPercent,
+		processMemoryWidth, humanBytesCompact(self.Memory))
+	return subtleStyle.Render(strings.TrimRight(line, " "))
+}
+
+func memoryPressureHigh(mem MemoryStatus) bool {
+	return mem.Pressure == "warn" || mem.Pressure == "critical"
+}
+
+// renderSwapAppsLine lists the apps macOS compressed the most memory from, as
+// many as fit the card: "Swap   dart 6.7G · Figma 2.9G". The first app always
+// shows, its name shortened if the card is narrow. The label turns to the
+// warning color while memory is under pressure.
+func renderSwapAppsLine(apps []SwapApp, cardWidth int, pressured bool) string {
+	label := fmt.Sprintf("%-*s", metricLabelWidth, "Swap")
+	used := lipgloss.Width(label) + 1
+	var entries []string
+	for i, app := range apps {
+		size := humanBytesCompact(app.Compressed)
+		entry := app.Name + " " + size
+		sep := 0
+		if i > 0 {
+			sep = len(" · ")
+		}
+		if cardWidth > 0 && used+sep+lipgloss.Width(entry) > cardWidth {
+			if i == 0 {
+				if room := cardWidth - used - lipgloss.Width(" "+size); room > 0 {
+					entries = append(entries, shorten(app.Name, room)+" "+size)
+				}
+			}
+			break
+		}
+		entries = append(entries, entry)
+		used += sep + lipgloss.Width(entry)
+	}
+	if pressured {
+		label = warnStyle.Render(label)
+	}
+	return label + " " + strings.Join(entries, " · ")
+}
+
 func processBar(percent float64, cardWidth int) string {
 	if cardWidth >= processWideMinWidth {
 		return progressBar(percent)
@@ -684,11 +813,17 @@ func processMemoryText(p ProcessInfo) string {
 // has completed at least once; until it has, an empty battery list means "not
 // measured yet", not "this Mac has no battery".
 func buildCards(m MetricsSnapshot, width int, cpuCores int, batteryProbed bool) []cardData {
+	return buildCardsWithProcessRows(m, width, cpuCores, batteryProbed, minProcessRows)
+}
+
+// buildCardsWithProcessRows is buildCards with the Processes card listing up
+// to processRows processes.
+func buildCardsWithProcessRows(m MetricsSnapshot, width int, cpuCores int, batteryProbed bool, processRows int) []cardData {
 	// Zombie counts stay in `status --json` for automation and out of the
 	// card: a reaped-child backlog is kernel vocabulary a reader cannot act
 	// on, the Mac app's own Status surface never showed it, and the row was
-	// spending one of three process slots to say it.
-	processCard := renderProcessCard(m.TopProcesses, width)
+	// spending one of the process slots to say it.
+	processCard := renderProcessCardRows(m.TopProcesses, width, processRows)
 	hasRenderedProcessData := len(m.TopProcesses) > 0
 	hasActiveProcessAlert := len(activeAlerts(m.ProcessAlerts)) > 0
 	switch {
@@ -718,13 +853,28 @@ func buildCards(m MetricsSnapshot, width int, cpuCores int, batteryProbed bool) 
 			processCard.lines = []string{warnStyle.Render("UNKNOWN · process sample unavailable")}
 		}
 	}
+	// Name the apps whose memory went to swap: they are usually idle, so the
+	// CPU-ranked rows above never show them. The collector reads them only
+	// under pressure or heavy swap (shouldCollectSwapApps).
+	if len(m.Memory.SwapApps) > 0 {
+		processCard.lines = append(processCard.lines, renderSwapAppsLine(m.Memory.SwapApps, width, memoryPressureHigh(m.Memory)))
+	}
+	if m.Self != nil {
+		processCard.lines = append(processCard.lines, renderSelfUsageRow(*m.Self, width))
+	}
 	cards := []cardData{
-		renderCPUCard(m.CPU, m.Thermal, cpuCores),
+		renderCPUCardWithGPU(m.CPU, m.Thermal, cpuCores, m.GPU),
 		renderMemoryCard(m.Memory, width),
 		renderDiskCard(m.Disks, m.DiskIO, m.TrashSize, m.TrashApprox),
 		renderBatteryCard(m.Batteries, m.Thermal, batteryProbed),
 		processCard,
 		renderNetworkCard(m.Network, m.NetworkHistory, m.Proxy, width),
+	}
+	if thermalCard, ok := renderThermalCard(m.Thermal, batteryProbed); ok {
+		cards = append(cards, thermalCard)
+	}
+	if portsCard, ok := renderPortsCard(m.Thermal.Ports); ok {
+		cards = append(cards, portsCard)
 	}
 	// Sensors card disabled - redundant with CPU temp
 	// if hasSensorData(m.Sensors) {
@@ -923,15 +1073,115 @@ func renderBatteryCard(batts []BatteryStatus, thermal ThermalStatus, probed bool
 			healthParts = append(healthParts, tempText)
 		}
 
-		if thermal.FanSpeed > 0 {
-			healthParts = append(healthParts, fmt.Sprintf("%d RPM", thermal.FanSpeed))
-		}
+		// Fan speeds have their own rows in the Thermal card.
 
 		summaryParts := append([]string{statusStyle.Render(statusText)}, healthParts...)
 		lines = append(lines, strings.Join(summaryParts, " · "))
 	}
 
 	return cardData{icon: iconBattery, title: "Power", lines: lines}
+}
+
+// renderThermalCard shows the hottest CPU core and one row per fan.
+// Before the first full collection it holds placeholders, like the Power card,
+// so the real values do not shift the layout. It reports false when a full
+// collection found neither a temperature nor a fan, and the card is left out.
+func renderThermalCard(thermal ThermalStatus, probed bool) (cardData, bool) {
+	card := cardData{icon: iconSensors, title: "Thermal"}
+	if !probed {
+		card.lines = []string{
+			fmt.Sprintf("%-*s %s  %6s", metricLabelWidth, "Core", plainProgressBar(0), placeholderValue),
+			// Placeholder fan row; the real card has one row per fan.
+			fmt.Sprintf("%-*s %s  %6s", metricLabelWidth, "Fan", plainProgressBar(0), placeholderValue),
+		}
+		return card, true
+	}
+
+	// The hottest CPU core; the CPU card shows the average of all cores.
+	if thermal.CPUMaxTemp > 0 {
+		card.lines = append(card.lines, fmt.Sprintf("%-*s %s  %s°C max",
+			metricLabelWidth, "Core",
+			colorizeByTemp(thermal.CPUMaxTemp, plainProgressBar(thermal.CPUMaxTemp)),
+			colorizeTemp(thermal.CPUMaxTemp)))
+	}
+
+	for _, fan := range thermal.Fans {
+		rpm := fmt.Sprintf("%d RPM", fan.RPM)
+		if fan.MaxRPM <= 0 {
+			card.lines = append(card.lines, fmt.Sprintf("%-*s %s", metricLabelWidth, fan.Name, rpm))
+			continue
+		}
+		percent := float64(fan.RPM) / float64(fan.MaxRPM) * 100
+		card.lines = append(card.lines, fmt.Sprintf("%-*s %s  %s",
+			metricLabelWidth, fan.Name, colorizePercent(percent, plainProgressBar(percent)), rpm))
+	}
+	// The system_profiler fallback reports a single speed and no per-fan rows.
+	if len(thermal.Fans) == 0 && thermal.FanSpeed > 0 {
+		card.lines = append(card.lines, fmt.Sprintf("%-*s %d RPM", metricLabelWidth, "Fan", thermal.FanSpeed))
+	}
+
+	return card, len(card.lines) > 0
+}
+
+const portNameWidth = 8
+
+// renderPortsCard lists the ports that carry something, power in first, then
+// power out, then other connected ports, and folds the free ports into one
+// row. It reports false when there are no USB-C or MagSafe ports to show.
+func renderPortsCard(ports []PortPower) (cardData, bool) {
+	if len(ports) == 0 {
+		return cardData{}, false
+	}
+	rank := func(p PortPower) int {
+		switch {
+		case p.Direction == "in":
+			return 0
+		case p.Direction == "out":
+			return 1
+		case p.Connected:
+			return 2
+		default:
+			return 3
+		}
+	}
+	ordered := slices.Clone(ports)
+	slices.SortStableFunc(ordered, func(a, b PortPower) int { return rank(a) - rank(b) })
+
+	card := cardData{icon: iconPorts, title: "Ports"}
+	var free []string
+	for _, p := range ordered {
+		if !p.Connected {
+			free = append(free, p.Name)
+			continue
+		}
+		card.lines = append(card.lines, formatPortLine(p))
+	}
+	if len(free) > 0 {
+		card.lines = append(card.lines, subtleStyle.Render(fmt.Sprintf("%-*s %s", portNameWidth, "Free", strings.Join(free, ", "))))
+	}
+	return card, true
+}
+
+// formatPortLine renders one connected port: live volts, amps and watts, then
+// the negotiated (in) or offered (out) maximum.
+func formatPortLine(p PortPower) string {
+	switch p.Direction {
+	case "in":
+		if p.Power > 0 {
+			return fmt.Sprintf("%-*s %s %5.1fV %4.2fA %5.1fW / %.0fW",
+				portNameWidth, p.Name, okStyle.Render("In "), p.Voltage, p.Current, p.Power, p.MaxPower)
+		}
+		return fmt.Sprintf("%-*s %s %5.1fV max %.0fW",
+			portNameWidth, p.Name, okStyle.Render("In "), p.ContractVoltage, p.MaxPower)
+	case "out":
+		line := fmt.Sprintf("%-*s Out %5.1fV %4.2fA %5.1fW", portNameWidth, p.Name, p.Voltage, p.Current, p.Power)
+		if p.MaxPower > 0 {
+			line += fmt.Sprintf(" / %.0fW", p.MaxPower)
+		}
+		return line
+	default:
+		return fmt.Sprintf("%-*s %s", portNameWidth, p.Name, subtleStyle.Render("connected"))
+	}
 }
 
 func isPoweredByAC(statusLower string) bool {
@@ -1058,13 +1308,19 @@ func colorizeBattery(percent float64, s string) string {
 }
 
 func colorizeTemp(t float64) string {
+	return colorizeByTemp(t, fmt.Sprintf("%.1f", t))
+}
+
+// colorizeByTemp renders s in the style the temperature t earns, so a bar and
+// its number change color at the same thresholds.
+func colorizeByTemp(t float64, s string) string {
 	switch {
 	case t >= thermalHighThreshold:
-		return dangerStyle.Render(fmt.Sprintf("%.1f", t))
+		return dangerStyle.Render(s)
 	case t >= thermalNormalThreshold:
-		return warnStyle.Render(fmt.Sprintf("%.1f", t))
+		return warnStyle.Render(s)
 	default:
-		return okStyle.Render(fmt.Sprintf("%.1f", t))
+		return okStyle.Render(s)
 	}
 }
 

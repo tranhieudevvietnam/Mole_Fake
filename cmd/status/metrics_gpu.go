@@ -24,6 +24,27 @@ var (
 	gpuIdleResidencyRe   = regexp.MustCompile(`GPU idle residency:\s+([\d.]+)%`)
 )
 
+// gpuStats is the live GPU reading: utilization in percent and the system
+// memory the GPU has in use, in bytes (Apple Silicon GPUs share system RAM).
+type gpuStats struct {
+	usage      float64
+	memoryUsed uint64
+}
+
+// readGPUStats is swapped in tests; the platform implementations live in
+// metrics_gpu_darwin.go and metrics_gpu_other.go.
+var readGPUStats = platformGPUStats
+
+// applyGPUStats writes a live reading into the first GPU. MemoryUsed is in
+// MiB, the unit the nvidia-smi path reports.
+func applyGPUStats(gpus []GPUStatus, stats gpuStats) {
+	if len(gpus) == 0 {
+		return
+	}
+	gpus[0].Usage = stats.usage
+	gpus[0].MemoryUsed = float64(stats.memoryUsed) / (1 << 20)
+}
+
 func (c *Collector) collectGPU(now time.Time) ([]GPUStatus, error) {
 	if runtime.GOOS == "darwin" {
 		// Static GPU info (cached 10 min).
@@ -34,14 +55,16 @@ func (c *Collector) collectGPU(now time.Time) ([]GPUStatus, error) {
 			}
 		}
 
-		// Real-time GPU usage.
+		// Real-time GPU usage, applied to the first GPU (Apple Silicon): the
+		// driver's statistics when readable, else powermetrics, which only
+		// answers a root run.
 		if len(c.cachedGPU) > 0 {
-			usage := c.getMacGPUUsage(now)
 			result := make([]GPUStatus, len(c.cachedGPU))
 			copy(result, c.cachedGPU)
-			// Apply usage to first GPU (Apple Silicon).
-			if len(result) > 0 {
-				result[0].Usage = usage
+			if stats, err := readGPUStats(); err == nil {
+				applyGPUStats(result, stats)
+			} else {
+				result[0].Usage = c.getMacGPUUsage(now)
 			}
 			return result, nil
 		}

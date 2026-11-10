@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -60,6 +61,10 @@ func (rb *RingBuffer) Slice() []float64 {
 }
 
 type MetricsSnapshot struct {
+	// powerRefreshedAt is the fast path's last power read, which starts each
+	// lap of the header mole. Not part of the JSON output.
+	powerRefreshedAt time.Time
+
 	CollectedAt    time.Time    `json:"collected_at"`
 	Host           string       `json:"host"`
 	Platform       string       `json:"platform"`
@@ -92,6 +97,8 @@ type MetricsSnapshot struct {
 	ZombieParentsComplete *bool              `json:"zombie_parents_complete,omitempty"`
 	ProcessWatch          ProcessWatchConfig `json:"process_watch"`
 	ProcessAlerts         []ProcessAlert     `json:"process_alerts"`
+	// Self is what mo status itself uses; absent until it has run a second.
+	Self *SelfUsage `json:"self,omitempty"`
 }
 
 type HardwareInfo struct {
@@ -136,6 +143,9 @@ type CPUStatus struct {
 	LogicalCPU       int       `json:"logical_cpu"`
 	PCoreCount       int       `json:"p_core_count"` // Performance cores (Apple Silicon)
 	ECoreCount       int       `json:"e_core_count"` // Efficiency cores (Apple Silicon)
+	// CoreTypes is each logical CPU's cluster, "E" or "P", from the device
+	// tree on Apple Silicon; empty elsewhere.
+	CoreTypes []string `json:"core_types,omitempty"`
 }
 
 type GPUStatus struct {
@@ -156,6 +166,15 @@ type MemoryStatus struct {
 	SwapTotal   uint64  `json:"swap_total"`
 	Cached      uint64  `json:"cached"`   // File cache that can be freed if needed
 	Pressure    string  `json:"pressure"` // macOS memory pressure: normal/warn/critical
+	// SwapApps names the apps macOS compressed the most memory from, read only
+	// under memory pressure (see collectSwapApps).
+	SwapApps []SwapApp `json:"swap_apps,omitempty"`
+}
+
+// SwapApp is one app and the memory macOS compressed from its processes.
+type SwapApp struct {
+	Name       string `json:"name"`
+	Compressed uint64 `json:"compressed"` // bytes
 }
 
 type DiskStatus struct {
@@ -210,14 +229,41 @@ type BatteryStatus struct {
 }
 
 type ThermalStatus struct {
-	CPUTemp      float64 `json:"cpu_temp"`
+	CPUTemp      float64 `json:"cpu_temp"`     // Average CPU core temperature
+	CPUMaxTemp   float64 `json:"cpu_max_temp"` // Hottest CPU core
 	GPUTemp      float64 `json:"gpu_temp"`
 	BatteryTemp  float64 `json:"battery_temp"` // Battery temperature in Celsius when exposed by AppleSmartBattery
-	FanSpeed     int     `json:"fan_speed"`
+	FanSpeed     int     `json:"fan_speed"`    // Average of Fans, or the system_profiler fallback
 	FanCount     int     `json:"fan_count"`
 	SystemPower  float64 `json:"system_power"`  // System power consumption in Watts
 	AdapterPower float64 `json:"adapter_power"` // AC adapter max power in Watts
 	BatteryPower float64 `json:"battery_power"` // Battery charge/discharge power in Watts (positive = discharging)
+	// Fans lists each fan the SMC reports, in SMC order.
+	Fans []FanReading `json:"fans,omitempty"`
+	// Ports lists the USB-C and MagSafe ports and the power through each.
+	Ports []PortPower `json:"ports,omitempty"`
+}
+
+// PortPower is one USB-C or MagSafe port and the power flowing through it.
+// Voltage, Current and Power are live measurements; ContractVoltage and
+// MaxPower are what the port negotiated (in) or offers the device (out).
+type PortPower struct {
+	Name            string  `json:"name"`
+	Connected       bool    `json:"connected"`
+	Direction       string  `json:"direction,omitempty"` // "in" charges the Mac, "out" powers a device
+	Voltage         float64 `json:"voltage,omitempty"`   // V
+	Current         float64 `json:"current,omitempty"`   // A
+	Power           float64 `json:"power,omitempty"`     // W
+	ContractVoltage float64 `json:"contract_voltage,omitempty"`
+	MaxPower        float64 `json:"max_power,omitempty"`
+}
+
+// FanReading is one fan's actual speed and, when the SMC reports it, its
+// maximum speed.
+type FanReading struct {
+	Name   string `json:"name"`
+	RPM    int    `json:"rpm"`
+	MaxRPM int    `json:"max_rpm,omitempty"`
 }
 
 type SensorReading struct {
@@ -258,6 +304,16 @@ type Collector struct {
 	prevDiskIO          disk.IOCountersStat
 	lastDiskAt          time.Time
 
+	// Mole's own CPU time, sampled each collection (see selfUsageAt).
+	selfMu      sync.Mutex
+	selfSamples []selfCPUSample
+
+	// Live power (ports, battery, charger), read on the fast path at most
+	// every powerRefreshInterval.
+	livePowerMu sync.Mutex
+	lastPowerAt time.Time
+	cachedPower livePower
+
 	watchMu           sync.Mutex
 	processWatch      ProcessWatchConfig
 	processWatcher    *ProcessWatcher
@@ -284,6 +340,12 @@ type collectedMetrics struct {
 	allProcs                []ProcessInfo
 	hasProcesses            bool
 	processParentsAvailable bool
+	// The fast path refreshes power every powerRefreshInterval, so a plug or
+	// unplug shows within seconds instead of at the next full collection.
+	livePower livePower
+	// The fast path reads GPU usage every tick from the driver's statistics.
+	liveGPU    gpuStats
+	hasLiveGPU bool
 }
 
 type snapshotEnrichment struct {
@@ -292,8 +354,10 @@ type snapshotEnrichment struct {
 	hardware       HardwareInfo
 	cpuPCores      int
 	cpuECores      int
+	cpuCoreTypes   []string
 	memoryCached   uint64
 	memoryPressure string
+	memorySwapApps []SwapApp
 	disks          []DiskStatus
 	hasDisks       bool
 	gpu            []GPUStatus
@@ -393,6 +457,17 @@ func (c *Collector) collectFast(includeProcesses bool) (MetricsSnapshot, error) 
 		func() (err error) { collected.diskIO = c.collectDiskIO(now); return nil },
 		func() (err error) { collected.netStats = c.collectNetwork(now); return nil },
 	}
+	if runtime.GOOS == "darwin" {
+		tasks = append(tasks, func() error {
+			collected.livePower = c.livePowerForTick(now)
+			return nil
+		})
+		tasks = append(tasks, func() error {
+			stats, err := readGPUStats()
+			collected.liveGPU, collected.hasLiveGPU = stats, err == nil
+			return nil
+		})
+	}
 	if includeProcesses {
 		tasks = append(tasks, func() error { return collectProcessesInto(&collected) })
 	}
@@ -401,6 +476,23 @@ func (c *Collector) collectFast(includeProcesses bool) (MetricsSnapshot, error) 
 
 	snapshot := c.snapshotFromMetrics(now, hostInfo, collected)
 	c.applyEnrichment(&snapshot, collected.hasProcesses)
+	// Enrichment restores the last full collection's battery and thermal data;
+	// a power reading from the last few seconds is newer. Without a good
+	// reading the cached values stay.
+	if collected.livePower.ports != nil {
+		snapshot.Thermal.Ports = collected.livePower.ports
+	}
+	if collected.livePower.hasBattery {
+		applyLiveBattery(&snapshot, collected.livePower.battery)
+	}
+	// The GPU's name and core count come from the full collection; its usage
+	// from this tick.
+	if collected.hasLiveGPU && len(snapshot.GPU) > 0 {
+		snapshot.GPU = slices.Clone(snapshot.GPU)
+		applyGPUStats(snapshot.GPU, collected.liveGPU)
+	}
+	snapshot.powerRefreshedAt = c.lastPowerRefresh()
+	snapshot.Self = c.selfUsageSnapshot(time.Now())
 	if collected.hasProcesses {
 		c.cacheProcessEnrichment(snapshot)
 	}
@@ -433,6 +525,7 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 	if cpuErr == nil {
 		next.cpuPCores = collected.cpuStats.PCoreCount
 		next.cpuECores = collected.cpuStats.ECoreCount
+		next.cpuCoreTypes = slices.Clone(collected.cpuStats.CoreTypes)
 	}
 
 	// Launch independent collection tasks.
@@ -443,6 +536,7 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 			if err == nil {
 				next.memoryCached = collected.memStats.Cached
 				next.memoryPressure = collected.memStats.Pressure
+				next.memorySwapApps = slices.Clone(collected.memStats.SwapApps)
 			}
 			return
 		},
@@ -525,6 +619,8 @@ func (c *Collector) collectFull() (MetricsSnapshot, error) {
 	if collected.hasProcesses {
 		c.cacheProcessEnrichment(snapshot)
 	}
+	snapshot.powerRefreshedAt = c.lastPowerRefresh()
+	snapshot.Self = c.selfUsageSnapshot(time.Now())
 	return snapshot, mergeErr
 }
 
@@ -558,7 +654,7 @@ func (c *Collector) snapshotFromMetrics(now time.Time, hostInfo *host.InfoStat, 
 	var zombieParents []ZombieParent
 	var zombieParentsComplete *bool
 	if collected.hasProcesses {
-		topProcs = topProcesses(collected.allProcs, 5)
+		topProcs = topProcesses(collected.allProcs, maxProcessRows)
 		processTime := now
 		stale := false
 		processCollectedAt = &processTime
@@ -680,8 +776,10 @@ func (e snapshotEnrichment) apply(snapshot *MetricsSnapshot) {
 	snapshot.Hardware = e.hardware
 	snapshot.CPU.PCoreCount = e.cpuPCores
 	snapshot.CPU.ECoreCount = e.cpuECores
+	snapshot.CPU.CoreTypes = slices.Clone(e.cpuCoreTypes)
 	snapshot.Memory.Cached = e.memoryCached
 	snapshot.Memory.Pressure = e.memoryPressure
+	snapshot.Memory.SwapApps = slices.Clone(e.memorySwapApps)
 	// Disk capacity is slow-changing and the corrections (APFS purgeable,
 	// diskutil, Finder) are expensive, so the fast path collects raw statfs
 	// values and we overwrite them with the last full-refresh corrected

@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -55,6 +57,9 @@ func collectCPUWithOptions(includeSlowFallbacks bool) (CPUStatus, error) {
 		percents, totalPercent, err = sampleCPUPercents(cpuSampleInterval)
 		sampled = err == nil && len(percents) > 0
 	}
+	if !sampled && !includeSlowFallbacks {
+		percents, totalPercent, sampled = fastCPUPercents(time.Now())
+	}
 	if !sampled {
 		percents, err = cpu.Percent(0, true)
 	}
@@ -95,10 +100,12 @@ func collectCPUWithOptions(includeSlowFallbacks bool) (CPUStatus, error) {
 		}
 	}
 
-	// P/E core counts for Apple Silicon.
+	// P/E core counts and each core's cluster for Apple Silicon.
 	var pCores, eCores int
+	var coreTypes []string
 	if includeSlowFallbacks {
 		pCores, eCores = getCoreTopology()
+		coreTypes = getCoreClusterTypes()
 	}
 
 	return CPUStatus{
@@ -112,6 +119,7 @@ func collectCPUWithOptions(includeSlowFallbacks bool) (CPUStatus, error) {
 		LogicalCPU:       logical,
 		PCoreCount:       pCores,
 		ECoreCount:       eCores,
+		CoreTypes:        coreTypes,
 	}, nil
 }
 
@@ -125,6 +133,81 @@ var (
 	cachedP, cachedE int
 	topologyTTL      = 10 * time.Minute
 )
+
+var (
+	// Cache for each logical CPU's cluster type.
+	lastClusterTypesAt time.Time
+	cachedClusterTypes []string
+)
+
+// getCoreClusterTypes returns each logical CPU's cluster ("E" or "P") from the
+// IODeviceTree, indexed like the per-core usage. Ordering is not assumed: an
+// Ultra interleaves its two dies' clusters, so "the first E-count CPUs are E"
+// would mislabel half of them. Returns nil when the tree has no cluster types.
+func getCoreClusterTypes() []string {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	now := time.Now()
+	if cachedClusterTypes != nil && now.Sub(lastClusterTypesAt) < topologyTTL && !now.Before(lastClusterTypesAt) {
+		return slices.Clone(cachedClusterTypes)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	out, err := runCmd(ctx, "ioreg", "-p", "IODeviceTree", "-r", "-n", "cpus", "-l", "-w0")
+	if err != nil {
+		return nil
+	}
+	types := parseCoreClusterTypes(out)
+	if types == nil {
+		return nil
+	}
+	cachedClusterTypes, lastClusterTypesAt = types, now
+	return slices.Clone(types)
+}
+
+// parseCoreClusterTypes reads the "+-o cpuN" nodes of the device tree's cpus
+// subtree, where "logical-cpu-id" = N and "cluster-type" = <"E"> come in
+// either order. Every logical CPU from 0 up must be typed, or the result is
+// nil rather than a partial map.
+func parseCoreClusterTypes(out string) []string {
+	byID := map[int]string{}
+	id, kind := -1, ""
+	commit := func() {
+		if id >= 0 && (kind == "E" || kind == "P") {
+			byID[id] = kind
+		}
+		id, kind = -1, ""
+	}
+	for line := range strings.Lines(out) {
+		trimmed := strings.TrimLeft(line, " |")
+		if strings.HasPrefix(trimmed, "+-o ") {
+			commit()
+			continue
+		}
+		if v, ok := ioRegValueForKey(trimmed, "logical-cpu-id"); ok {
+			if n, err := strconv.Atoi(v); err == nil {
+				id = n
+			}
+		}
+		if _, rest, found := strings.Cut(trimmed, `"cluster-type" = <"`); found {
+			kind, _, _ = strings.Cut(rest, `"`)
+		}
+	}
+	commit()
+	if len(byID) == 0 {
+		return nil
+	}
+	types := make([]string, len(byID))
+	for i := range types {
+		t, ok := byID[i]
+		if !ok {
+			return nil
+		}
+		types[i] = t
+	}
+	return types
+}
 
 // getCoreTopology returns P/E core counts on Apple Silicon.
 func getCoreTopology() (pCores, eCores int) {
@@ -293,6 +376,48 @@ func fallbackCPUUtilization(logical int) (float64, []float64, error) {
 
 func warmUpCPU() {
 	cpu.Percent(0, true) //nolint:errcheck
+}
+
+// The fast path keeps the previous tick's per-core times so each tick applies
+// the full path's wall-clock floor (#1237) over the time since the last tick,
+// without sleeping. cpu.Percent(0, true) measures the same interval but
+// divides by the raw ticks, so between full refreshes it showed a parked
+// E-core at 90-100%.
+var (
+	fastCPUMu    sync.Mutex
+	fastCPUTimes []cpu.TimesStat
+	fastCPUAt    time.Time
+	cpuTimesFunc = cpu.Times
+)
+
+// minFastCPUWindow is the shortest tick-to-tick window worth a reading; a
+// shorter one keeps the older baseline so the next tick measures more.
+const minFastCPUWindow = 200 * time.Millisecond
+
+// fastCPUPercents returns per-core and total usage since the previous call,
+// or false on the first call, after a core-count change, a clock that went
+// back, or a window under minFastCPUWindow.
+func fastCPUPercents(now time.Time) ([]float64, float64, bool) {
+	times, err := cpuTimesFunc(true)
+	if err != nil || len(times) == 0 {
+		return nil, 0, false
+	}
+	fastCPUMu.Lock()
+	defer fastCPUMu.Unlock()
+	prev, elapsed := fastCPUTimes, now.Sub(fastCPUAt)
+	if len(prev) != len(times) || elapsed < 0 {
+		fastCPUTimes, fastCPUAt = times, now
+		return nil, 0, false
+	}
+	if elapsed < minFastCPUWindow {
+		return nil, 0, false
+	}
+	fastCPUTimes, fastCPUAt = times, now
+	percents, total, err := perCoreUsageFromTimes(prev, times, elapsed.Seconds())
+	if err != nil {
+		return nil, 0, false
+	}
+	return percents, total, true
 }
 
 // sampleCPUPercents measures per-core and total CPU usage over one wall-clock

@@ -20,6 +20,11 @@ func statusDiagnosisLine(m MetricsSnapshot) string {
 		return "CPU load high"
 	}
 	if m.Memory.Pressure == "warn" || m.Memory.Pressure == "critical" || m.Memory.UsedPercent > memHighThreshold {
+		// The app with the most memory in swap, when known, is the one to
+		// close; the largest resident process may be the one still in use.
+		if memoryPressureHigh(m.Memory) && len(m.Memory.SwapApps) > 0 {
+			return fmt.Sprintf("%s memory pressure", shorten(m.Memory.SwapApps[0].Name, 18))
+		}
 		if processSnapshotFresh(m.ProcessStale) {
 			if proc, ok := leadingMemoryProcess(m.TopProcesses); ok && proc.Memory > 0 {
 				return fmt.Sprintf("%s memory pressure", shorten(proc.Name, 18))

@@ -29,8 +29,14 @@ func collectMemoryWithOptions(includeSlowAnnotations bool) (MemoryStatus, error)
 		swap = &mem.SwapMemoryStat{}
 	}
 	var pressure string
+	var swapApps []SwapApp
 	if includeSlowAnnotations {
 		pressure = getMemoryPressure()
+		// Naming who is in swap costs a one-second top run; swapAppsFor runs
+		// it only under pressure or heavy swap, at most once a minute.
+		if runtime.GOOS == "darwin" {
+			swapApps = swapAppsFor(pressure, swap.Used, time.Now())
+		}
 	}
 
 	// On macOS, vm.Cached is 0, so we calculate from file-backed pages.
@@ -48,6 +54,7 @@ func collectMemoryWithOptions(includeSlowAnnotations bool) (MemoryStatus, error)
 		SwapTotal:   swap.Total,
 		Cached:      cached,
 		Pressure:    pressure,
+		SwapApps:    swapApps,
 	}, nil
 }
 
@@ -110,5 +117,32 @@ func getMemoryPressure() string {
 	if strings.Contains(lower, "normal") {
 		return "normal"
 	}
+	// memory_pressure on macOS 27 prints page statistics and a free percentage
+	// but no level word, which left Pressure empty and every memory pressure
+	// warning silent. Take the level from the kernel instead.
+	if level, err := readVMPressureLevel(); err == nil {
+		return pressureFromLevel(level)
+	}
 	return ""
+}
+
+// readVMPressureLevel reads kern.memorystatus_vm_pressure_level, the kernel
+// level Activity Monitor's Memory Pressure graph is colored by. Swapped in
+// tests; the platform implementations live in metrics_memory_darwin.go and
+// metrics_memory_other.go.
+var readVMPressureLevel = platformVMPressureLevel
+
+// pressureFromLevel maps the kernel's pressure level to Mole's labels:
+// 1 normal, 2 warn, 4 critical. Any other value is unknown.
+func pressureFromLevel(level uint32) string {
+	switch level {
+	case 1:
+		return "normal"
+	case 2:
+		return "warn"
+	case 4:
+		return "critical"
+	default:
+		return ""
+	}
 }

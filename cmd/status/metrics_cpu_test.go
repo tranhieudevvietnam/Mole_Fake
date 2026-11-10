@@ -2,7 +2,9 @@ package main
 
 import (
 	"math"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
 )
@@ -128,5 +130,125 @@ func TestParseCoreTopologyUsesLevelOrderNotLevelNames(t *testing.T) {
 		if p, e := parseCoreTopology(out); p != 0 || e != 0 {
 			t.Fatalf("unusable output %q: expected 0P + 0E, got %dP + %dE", out, p, e)
 		}
+	}
+}
+
+// stubFastCPUTimes replays per-core time snapshots and resets the fast sampler.
+func stubFastCPUTimes(t *testing.T, snapshots ...[]cpu.TimesStat) {
+	t.Helper()
+	origTimes := cpuTimesFunc
+	fastCPUMu.Lock()
+	origPrev, origAt := fastCPUTimes, fastCPUAt
+	fastCPUTimes, fastCPUAt = nil, time.Time{}
+	fastCPUMu.Unlock()
+	t.Cleanup(func() {
+		cpuTimesFunc = origTimes
+		fastCPUMu.Lock()
+		fastCPUTimes, fastCPUAt = origPrev, origAt
+		fastCPUMu.Unlock()
+	})
+	next := 0
+	cpuTimesFunc = func(bool) ([]cpu.TimesStat, error) {
+		if next >= len(snapshots) {
+			t.Fatalf("cpu.Times called %d times, only %d snapshots", next+1, len(snapshots))
+		}
+		snap := snapshots[next]
+		next++
+		return snap, nil
+	}
+}
+
+// The fast path used cpu.Percent(0, true), which divides by raw ticks: between
+// full refreshes a parked E-core read 90-100% (#1237). It must apply the same
+// wall-clock floor as the full path over the time since the previous tick.
+func TestFastCPUPercentsFloorsParkedCoreAtTickWindow(t *testing.T) {
+	stubFastCPUTimes(t,
+		[]cpu.TimesStat{{CPU: "cpu0", User: 10, Idle: 100}, {CPU: "cpu1", User: 10, Idle: 100}},
+		// One second later: cpu0 was awake 0.05s, all busy, with no idle
+		// ticks (parked); cpu1 was awake the whole second, half busy.
+		[]cpu.TimesStat{{CPU: "cpu0", User: 10.05, Idle: 100}, {CPU: "cpu1", User: 10.5, Idle: 100.5}},
+	)
+	start := time.Now()
+
+	if _, _, ok := fastCPUPercents(start); ok {
+		t.Fatal("the first tick only records a baseline")
+	}
+	percents, total, ok := fastCPUPercents(start.Add(time.Second))
+	if !ok {
+		t.Fatal("the second tick should produce a reading")
+	}
+	if !almostEqual(percents[0], 5) || !almostEqual(percents[1], 50) {
+		t.Fatalf("expected the parked core at 5%% and the awake core at 50%%, got %v", percents)
+	}
+	if !almostEqual(total, 27.5) {
+		t.Fatalf("expected a window-weighted total of 27.5%%, got %.2f", total)
+	}
+}
+
+func TestFastCPUPercentsKeepsBaselineForShortWindowAndResetsOnClockBack(t *testing.T) {
+	base := []cpu.TimesStat{{CPU: "cpu0", User: 10, Idle: 100}}
+	stubFastCPUTimes(t,
+		base,
+		[]cpu.TimesStat{{CPU: "cpu0", User: 10.05, Idle: 100.05}},
+		[]cpu.TimesStat{{CPU: "cpu0", User: 10.25, Idle: 100.75}},
+		[]cpu.TimesStat{{CPU: "cpu0", User: 11, Idle: 101}},
+	)
+	start := time.Now()
+
+	fastCPUPercents(start)
+	if _, _, ok := fastCPUPercents(start.Add(100 * time.Millisecond)); ok {
+		t.Fatal("a 100ms window is too short to report")
+	}
+	// The baseline is still the first snapshot, so this window is a full second.
+	percents, _, ok := fastCPUPercents(start.Add(time.Second))
+	if !ok || !almostEqual(percents[0], 25) {
+		t.Fatalf("expected 25%% over the second since the first tick, got %v (ok=%v)", percents, ok)
+	}
+	if _, _, ok := fastCPUPercents(start); ok {
+		t.Fatal("a clock that went back must reset the baseline, not report")
+	}
+}
+
+// cpusTreeFixture is `ioreg -p IODeviceTree -r -n cpus -l -w0` on an M1 Pro,
+// trimmed to three CPUs. cpu1 lists cluster-type before logical-cpu-id.
+const cpusTreeFixture = `+-o cpus  <class IOPlatformDevice, id 0x10000028c, registered, matched, active, busy 0 (62 ms), retain 16>
+  | {
+  |   "#size-cells" = <00000000>
+  | }
+  |
+  +-o cpu0@0  <class IOPlatformDevice, id 0x100000280, registered, matched, active, busy 0 (4 ms), retain 8>
+  |   {
+  |     "logical-cluster-id" = 0
+  |     "logical-cpu-id" = 0
+  |     "cluster-type" = <"E">
+  |   }
+  |
+  +-o cpu1@1  <class IOPlatformDevice, id 0x100000281, registered, matched, active, busy 0 (61 ms), retain 8>
+  |   {
+  |     "cluster-type" = <"E">
+  |     "logical-cpu-id" = 1
+  |   }
+  |
+  +-o cpu2@100  <class IOPlatformDevice, id 0x100000282, registered, matched, active, busy 0 (71 ms), retain 8>
+      {
+        "cluster-type" = <"P">
+        "logical-cpu-id" = 2
+      }
+`
+
+func TestParseCoreClusterTypes(t *testing.T) {
+	got := parseCoreClusterTypes(cpusTreeFixture)
+	if len(got) != 3 || got[0] != "E" || got[1] != "E" || got[2] != "P" {
+		t.Fatalf("expected E E P, got %v", got)
+	}
+}
+
+func TestParseCoreClusterTypesRejectsGapsAndEmptyTrees(t *testing.T) {
+	gap := strings.Replace(cpusTreeFixture, `"logical-cpu-id" = 1`, `"logical-cpu-id" = 5`, 1)
+	if got := parseCoreClusterTypes(gap); got != nil {
+		t.Fatalf("a missing logical CPU must not yield a partial map, got %v", got)
+	}
+	if got := parseCoreClusterTypes("+-o cpus  <class IOPlatformDevice>\n"); got != nil {
+		t.Fatalf("a tree without cluster types yields nil, got %v", got)
 	}
 }
